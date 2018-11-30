@@ -4,81 +4,100 @@ from __future__ import absolute_import
 import sys
 from git import Repo
 from git import cmd
+
 sys.path.insert(0, '.repo/repo')
 from manifest_xml import GitcManifest, XmlManifest
 
 
-
-def _contrast_with_revision_id(project, repo):
+def _contrast_with_revision_id(project, git, repo):
     if not project:
         print("_contrast_with_revisionId project is null")
-        return
+        return 0
     if not repo:
         print("_contrast_with_revisionId repo is null")
-        return
+        return 0
     revision_id = project.revisionId
     commit_id = repo.active_branch.object.hexsha
+    if not revision_id:
+        print("Manifest not define revisionId! user remote")
+        return _contrast_with_remote_id(project, git, repo)
+
     if revision_id != commit_id:
-        need_show.append("revision:" + project.relpath)
-        print("revisionId:" + revision_id)
-        print("commitId:" + commit_id)
+        need_show.append("revision:%s" % str(project.relpath))
+        print("revisionId = %s" % str(revision_id))
+        print("commitId   = %s" % str(commit_id))
+        return 1
+    return 0
 
 
 def _contrast_with_remote_id(project, git, repo):
     if not project:
         print("_contrast_with_remote_id project is null")
-        return
+        return 0
     if not repo:
         print("_contrast_with_remote_id repo is null")
-        return
+        return 0
     if not git:
         print("_contrast_with_remote_id git is null")
-        return
+        return 0
 
     remote_id = git.ls_remote(project.remote.name, project.upstream)
     remote_id = remote_id.split('\t')[0]
     commit_id = repo.active_branch.object.hexsha
     if remote_id != commit_id:
-        need_show.append("remote:" + project.relpath)
-        print("project.remote.name:" + project.remote.name)
-        print("project.remote.upstream:" + project.upstream)
-        print("remoteId:" + remote_id)
-        print("commitId:" + commit_id)
+        need_show.append("remote:%s" % str(project.relpath))
+        print("remote.name     = %s" % str(project.remote.name))
+        print("remote.upstream = %s" % str(project.upstream))
+        print("remoteId        = %s" % str(remote_id))
+        print("commitId        = %s" % str(commit_id))
+        return 1
+    return 0
 
 
 def _project_mode(argv, manifest):
     all_paths = manifest.paths
 
     for path in argv:
+        if path.endswith('/'):
+            path = path.rstrip('/')
+
+        tmp = path
+        while tmp not in all_paths:
+            if not tmp.__contains__('/'):
+                print("path:%s is not git repo!!" % str(path))
+                return 0
+            tmp = "/".join(tmp.split('/')[:-1])
+        path = tmp
+        print("cd project: \033[0;33;40m%s\033[0m" % str(path))
         project = all_paths[path]
         if not project:
-            print(path + ": project not found!!")
-        print("project.name=" + project.name)
-        print("project.remote=" + project.remote.name)
-        print("project.revisionId=" + project.revisionId)
-        print("project.upstream=" + project.upstream)
+            print("\033[0;33;40m%s\033[0m: project not found!!" % str(path))
+        print("project.name       = %s" % str(project.name))
+        print("project.remote     = %s" % str(project.remote.name))
+        print("project.revisionId = %s" % str(project.revisionId))
+        print("project.upstream   = %s" % str(project.upstream))
         repo = Repo(project.relpath)
         git = cmd.Git(project.relpath)
         remote_id = git.ls_remote(project.remote.name, project.upstream)
         remote_id = remote_id.split('\t')[0]
-        print("git.active_branch:" + repo.active_branch.name)
-        print("git.commit:" + repo.active_branch.object.hexsha)
-        print("git.remote:" + remote_id)
+        print("git.active_branch  = %s" % str(repo.active_branch.name))
+        print("git.commit         = %s" % str(repo.active_branch.object.hexsha))
+        print("git.remote         = %s" % str(remote_id))
 
 
 def _project_all(command, manifest):
     all_projects_list = manifest.projects
     for project in all_projects_list:
-        print("\033[0;33;40mproject:" + project.relpath + "\033[0m")
+        print("\033[0;33;40mproject:%s \033[0m" % str(project.relpath))
         repo = Repo(project.relpath)
         git = cmd.Git(project.relpath)
         if command == "remote":
             _contrast_with_remote_id(project, git, repo)
         elif command == "revision" or "rev":
-            _contrast_with_revision_id(project, repo)
+            _contrast_with_revision_id(project, git, repo)
         else:
             _contrast_with_remote_id(project, git, repo)
-            _contrast_with_revision_id(project, repo)
+            _contrast_with_revision_id(project, git, repo)
 
 
 def _main(argv):
@@ -98,7 +117,7 @@ def _main(argv):
         _project_all(command_mode, manifest)
         print("###################################end")
         for path in need_show:
-            print("\033[0;31;40m" + path + "\033[0m")
+            print("\033[0;31;40m%s\033[0m" % str(path))
 
 
 need_show = list()
