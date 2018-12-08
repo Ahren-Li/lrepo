@@ -1,44 +1,256 @@
 #!/usr/bin/env python
 from __future__ import absolute_import
+from __future__ import print_function
 
+import optparse
 import sys
+import xml.dom.minidom
+
 from git import Repo
 from git import cmd
+from git import RemoteProgress
+from git import GitCommandError
+
+import gitlab
+from gitlab.exceptions import GitlabGetError
 
 sys.path.insert(0, '.repo/repo')
-from manifest_xml import GitcManifest, XmlManifest
+from manifest_xml import _XmlRemote, XmlManifest
+from project import RemoteSpec
+
+
+def enum(**enums):
+    return type('Enum', (), enums)
+
+
+def _my_print(level, message):
+    print("\033[0;%s;49m%s\033[0m" % (str(level), str(message)))
+
+
+def _my_print_start(level, start, message):
+    print("\033[0;%s;49m%-30s: %s\033[0m" % (str(level), str(start), str(message)))
+
+
+class MyProgressPrinter(RemoteProgress):
+    def update(self, op_code, cur_count, max_count=None, message=''):
+        end = '\r'
+        if op_code & RemoteProgress.END:
+            end = ',' + RemoteProgress.DONE_TOKEN + '\n'
+
+        op_code = op_code & RemoteProgress.OP_MASK
+        if op_code == RemoteProgress.COUNTING:
+            print('Counting objects: %d %s' % (cur_count, str(message)), end=end)
+        elif op_code == RemoteProgress.COMPRESSING:
+            print('Compressing objects: %d%% (%d/%d) %s' % ((cur_count/max_count) * 100, cur_count,
+                                                            max_count, str(message)), end=end)
+        elif op_code == RemoteProgress.WRITING:
+            print('Writing objects: %d%% (%d/%d) %s' % ((cur_count/max_count) * 100, cur_count,
+                                                        max_count, str(message)), end=end)
+        elif op_code == RemoteProgress.RESOLVING:
+            print('remote: Resolving deltas: %d%% (%d/%d) %s' % ((cur_count/max_count) * 100, cur_count,
+                                                                 max_count, str(message)), end=end)
+        # print(op_code, cur_count, max_count, cur_count / (max_count or 100.0), message or "NO MESSAGE")
+
+
+def _gitlab(argv, manifest):
+    global global_group_name
+
+    options = optparse.OptionParser(
+        usage="gitlab [-t|--token] [-g|--group] [-v|--visibility] PATH"
+    )
+    options.add_option('-u', '--url',
+                       dest='url',
+                       help='what url do you want to upload')
+    options.add_option('-g', '--group',
+                       dest='group',
+                       help='gitlab group id or name')
+    options.add_option('-t', '--token',
+                       dest='private_token',
+                       help='gitlab private_token')
+    options.add_option('-r', '--remote',
+                       dest='remote', action="append",
+                       help='manifest which remote to gitlab')
+    options.add_option('-v', '--visibility', choices=('private', 'internal', 'public'),
+                       dest='visibility',
+                       help='gitlab create visibility')
+
+    option, _path = options.parse_args(argv)
+
+    url_gitlab = option.url
+    group_flg = option.group
+    private_token = option.private_token
+    visibility = option.visibility
+
+    if not url_gitlab:
+        url_gitlab = 'https://gitlab.com'
+        _my_print(DEBUG.NORMAL, "default url: 'https://gitlab.com")
+    if not group_flg:
+        _my_print(DEBUG.ERROR, "can out give group name or id !!!!")
+        return
+    if not private_token:
+        _my_print(DEBUG.ERROR, "can out give private_token !!!!")
+        return
+    if not visibility:
+        visibility = 'public'
+        _my_print(DEBUG.NORMAL, "default visibility to public")
+
+    gitlab_manager = gitlab.Gitlab(url_gitlab, private_token=private_token)
+    group_manager = gitlab_manager.groups
+    parent_group_id = group_manager.get(group_flg).get_id()
+    global_group_name = group_manager.get(group_flg).name
+    if _path:
+        _do_path_gitlab(_path, manifest, gitlab_manager, parent_group_id)
+    else:
+        _do_all_gitlab(manifest, option.remote, gitlab_manager, parent_group_id)
+
+
+def _do_path_gitlab(paths, manifest, gitlab_manager, parent_group_id):
+
+    for path in paths:
+        project = _get_project_path_by_path(path, manifest)
+        if not project:
+            _my_print(DEBUG.ERROR, "project not found:%s" % str(path))
+            continue
+        _my_print(DEBUG.PATH, 'gitlab:%s' % project.relpath)
+        _check_group_remote(project)
+        _check_project_upstream(project, manifest)
+        _do_gitlab(gitlab_manager, project, parent_group_id)
+
+
+def _do_all_gitlab(manifest, remotes, gitlab_manager, parent_group_id):
+    all_projects_list = manifest.projects
+    for project in all_projects_list:
+        if remotes and project.remote.name not in remotes:
+            continue
+
+        _my_print(DEBUG.PROJECT, 'project:%s' % str(project.relpath))
+        _check_group_remote(project)
+        _check_project_upstream(project, manifest)
+        try_num = 0
+        while try_num < 5:
+            try:
+                _do_gitlab(gitlab_manager, project, parent_group_id)
+                break
+            except GitCommandError as error:
+                _my_print(DEBUG.ERROR, "Error(%d) :%s" % (try_num, str(error.stderr)))
+                try_num += 1
+            except Exception as error:
+                _my_print(DEBUG.ERROR, "Error(%d) :%s" % (try_num, str(error.message)))
+                try_num += 1
+        if try_num >= 5:
+            need_show.append("Error to gitlab:%s" % str(project.relpath))
+
+
+def _do_gitlab(gitlab_manager, project, parent_group_id):
+    path = project.name
+    if path.endswith('/'):
+        path = path.rstrip('/')
+    gitlab_project = _make_gitlab_project(gitlab_manager, parent_group_id, path)
+    if gitlab_project:
+        _my_print_start(DEBUG.REMOTE, 'Remote path', path)
+        _my_print_start(DEBUG.REMOTE,  'URL', gitlab_project.http_url_to_repo)
+        repo = Repo(project.relpath)
+        try:
+            local_remote = repo.remote('gitlab')
+            if gitlab_project.ssh_url_to_repo not in local_remote.urls:
+                _my_print(DEBUG.NORMAL, 'Add local remote url')
+                local_remote.add_url(gitlab_project.ssh_url_to_repo)
+        except ValueError:
+            _my_print(DEBUG.NORMAL, 'Create local remote gitlab')
+            local_remote = repo.create_remote('gitlab', gitlab_project.ssh_url_to_repo)
+        finally:
+            pass
+        if local_remote:
+            _my_print_start(DEBUG.REMOTE, "Push to remote", str(gitlab_project.ssh_url_to_repo))
+            if repo.active_branch:
+                ref_spec = repo.active_branch.name
+                if project.upstream:
+                    ref_spec += ":" + project.upstream
+            else:
+                _my_print(DEBUG.ERROR, "Can't get local git branch!!")
+                return
+
+            _my_print_start(DEBUG.REMOTE, "Push ref spec", ref_spec)
+            # num = 0
+            # while num <= 2:
+            #     try:
+            local_remote.push(ref_spec, progress=MyProgressPrinter())
+                    # return
+                # except GitCommandError as error:
+                #     if 'Could not read from remote repository' in error.stderr:
+                #         print('Retry %d:' % num + error.stderr)
+                #         num += 1
+            # _my_print(DEBUG.ERROR, "Push Error!!")
+
+
+def _make_gitlab_project(gitlab_manager, parent_group_id, path):
+
+    if '/' in path:
+        paths = path.split('/')
+        child_path = '/'.join(paths[1:])
+        group_manager = gitlab_manager.groups
+        group = group_manager.get(parent_group_id)
+        _my_print_start(DEBUG.GROUP, 'Going to group', group.name)
+        subgroup_manager = group.subgroups
+        subgroup = subgroup_manager.list(search=paths[0])
+        if not subgroup:
+            _my_print_start(DEBUG.SUBGROUP, 'Create group', paths[0])
+            new_group = group_manager.create({'name': paths[0], 'path': paths[0],
+                                              'parent_id': parent_group_id, 'visibility': 'public'})
+            parent_group_id = new_group.get_id()
+        else:
+            if subgroup.__len__() == 1:
+                _my_print_start(DEBUG.SUBGROUP, 'Found subgroup', paths[0])
+                parent_group_id = subgroup[0].get_id()
+            else:
+                # TODO
+                _my_print(DEBUG.ERROR, "Found the same subgroup name:%s" % paths[0])
+
+        return _make_gitlab_project(gitlab_manager, parent_group_id, child_path)
+    else:
+        group_manager = gitlab_manager.groups
+        project_manager = gitlab_manager.projects
+        group = group_manager.get(parent_group_id)
+        try:
+            project = project_manager.get(group.full_path + '/' + path)
+            _my_print_start(DEBUG.PROJECT, 'Found project', project.name)
+            return project
+        except GitlabGetError:
+            _my_print_start(DEBUG.PROJECT, 'Create project', path)
+            return project_manager.create({'name': path, 'path': path,
+                                           'namespace_id': parent_group_id, 'visibility': 'public'})
 
 
 def _contrast_with_revision_id(project, git, repo):
     if not project:
-        print("_contrast_with_revisionId project is null")
+        _my_print(DEBUG.ERROR, "_contrast_with_revisionId project is null")
         return 0
     if not repo:
-        print("_contrast_with_revisionId repo is null")
+        _my_print(DEBUG.ERROR, "_contrast_with_revisionId repo is null")
         return 0
     revision_id = project.revisionId
     commit_id = repo.active_branch.object.hexsha
     if not revision_id:
-        print("Manifest not define revisionId! user remote")
+        _my_print(DEBUG.ERROR, "Manifest not define revisionId! user remote")
         return _contrast_with_remote_id(project, git, repo)
 
     if revision_id != commit_id:
         need_show.append("revision:%s" % str(project.relpath))
-        print("revisionId = %s" % str(revision_id))
-        print("commitId   = %s" % str(commit_id))
+        _my_print(DEBUG.NORMAL, "revisionId = %s" % str(revision_id))
+        _my_print(DEBUG.NORMAL, "commitId   = %s" % str(commit_id))
         return 1
     return 0
 
 
 def _contrast_with_remote_id(project, git, repo):
     if not project:
-        print("_contrast_with_remote_id project is null")
+        _my_print(DEBUG.ERROR, "_contrast_with_remote_id project is null")
         return 0
     if not repo:
-        print("_contrast_with_remote_id repo is null")
+        _my_print(DEBUG.ERROR, "_contrast_with_remote_id repo is null")
         return 0
     if not git:
-        print("_contrast_with_remote_id git is null")
+        _my_print(DEBUG.ERROR, "_contrast_with_remote_id git is null")
         return 0
 
     remote_id = git.ls_remote(project.remote.name, project.upstream)
@@ -46,49 +258,90 @@ def _contrast_with_remote_id(project, git, repo):
     commit_id = repo.active_branch.object.hexsha
     if remote_id != commit_id:
         need_show.append("remote:%s" % str(project.relpath))
-        print("remote.name     = %s" % str(project.remote.name))
-        print("remote.upstream = %s" % str(project.upstream))
-        print("remoteId        = %s" % str(remote_id))
-        print("commitId        = %s" % str(commit_id))
+        _my_print(DEBUG.NORMAL, "remote.name     = %s" % str(project.remote.name))
+        _my_print(DEBUG.NORMAL, "remote.upstream = %s" % str(project.upstream))
+        _my_print(DEBUG.NORMAL, "remoteId        = %s" % str(remote_id))
+        _my_print(DEBUG.NORMAL, "commitId        = %s" % str(commit_id))
         return 1
     return 0
 
 
-def _project_mode(argv, manifest):
+def _check_group_remote(project):
+    global group_name_not_equal
+    global global_group_name
+
+    if not group_name_not_equal and (global_group_name != project.remote.name):
+        _my_print(DEBUG.WARR, 'Project %s remote not equal group %s' % (project.relpath, global_group_name))
+        _my_print(DEBUG.WARR, 'ignore ? N/y ')
+        result = raw_input()
+        if result == 'y' or result == 'Y':
+            group_name_not_equal = 1
+        else:
+            exit(-1)
+
+
+def _get_project_path_by_path(path, manifest):
     all_paths = manifest.paths
+    tmp = path
+    if tmp.endswith('/'):
+        tmp = tmp.rstrip('/')
+    while tmp not in all_paths:
+        if not tmp.__contains__('/'):
+            _my_print_start(DEBUG.PATH, 'Project not git repo', path)
+            return None
+        tmp = "/".join(tmp.split('/')[:-1])
+    return all_paths[tmp]
+
+
+def _check_project_upstream(project, manifest):
+    if not project:
+        return
+    if project.upstream:
+        return
+
+    project_remote = project.remote
+    default_remote = manifest.default.remote
+    if project_remote.name == default_remote.name:
+        if default_remote.revisionExpr:
+            project.upstream = default_remote.revisionExpr
+    else:
+        manifest_remote = manifest.remotes[project_remote.name]
+        if manifest_remote.revision:
+            project.upstream = manifest_remote.revision
+    _my_print(DEBUG.NORMAL, "Set project upstream to:%s" % project.upstream)
+
+
+def _project_mode(argv, manifest):
 
     for path in argv:
-        if path.endswith('/'):
-            path = path.rstrip('/')
-
-        tmp = path
-        while tmp not in all_paths:
-            if not tmp.__contains__('/'):
-                print("path:%s is not git repo!!" % str(path))
-                return 0
-            tmp = "/".join(tmp.split('/')[:-1])
-        path = tmp
-        print("cd project: \033[0;33;40m%s\033[0m" % str(path))
-        project = all_paths[path]
+        project = _get_project_path_by_path(path, manifest)
         if not project:
-            print("\033[0;33;40m%s\033[0m: project not found!!" % str(path))
-        print("project.name       = %s" % str(project.name))
-        print("project.remote     = %s" % str(project.remote.name))
-        print("project.revisionId = %s" % str(project.revisionId))
-        print("project.upstream   = %s" % str(project.upstream))
+            _my_print_start(DEBUG.PROJECT, 'Project not found', path)
+            continue
+        _check_project_upstream(project, manifest)
+        _my_print(DEBUG.PROJECT, project.relpath)
+        _my_print(DEBUG.NORMAL, "project.name            = %s" % str(project.name))
+        _my_print(DEBUG.NORMAL, "project.remote          = %s" % str(project.remote.name))
+        _my_print(DEBUG.NORMAL, "project.revisionId      = %s" % str(project.revisionId))
+        _my_print(DEBUG.NORMAL, "project.upstream        = %s" % str(project.upstream))
         repo = Repo(project.relpath)
         git = cmd.Git(project.relpath)
         remote_id = git.ls_remote(project.remote.name, project.upstream)
         remote_id = remote_id.split('\t')[0]
-        print("git.active_branch  = %s" % str(repo.active_branch.name))
-        print("git.commit         = %s" % str(repo.active_branch.object.hexsha))
-        print("git.remote         = %s" % str(remote_id))
+        _my_print(DEBUG.NORMAL, "git.active_branch  = %s" % str(repo.active_branch.name))
+        _my_print(DEBUG.NORMAL, "git.commit         = %s" % str(repo.active_branch.object.hexsha))
+        _my_print(DEBUG.REMOTE, "git.remote         = %s" % str(remote_id))
 
 
-def _project_all(command, manifest):
+def _project_all(argv, manifest):
+    command = "all"
+    if argv and argv.__len__() > 0:
+        command = argv[0]
+
     all_projects_list = manifest.projects
     for project in all_projects_list:
-        print("\033[0;33;40mproject:%s \033[0m" % str(project.relpath))
+        _my_print(DEBUG.PROJECT, "project:%s" % str(project.relpath))
+        _check_project_upstream(project, manifest)
         repo = Repo(project.relpath)
         git = cmd.Git(project.relpath)
         if command == "remote":
@@ -100,26 +353,87 @@ def _project_all(command, manifest):
             _contrast_with_revision_id(project, git, repo)
 
 
+def _export(argv, manifest):
+    options = optparse.OptionParser(
+        usage="export [-b|--by] <attr> [-g|--grep] <filter> [-o|--out] <PATH>"
+    )
+    options.add_option('-b', '--by',
+                       dest='attr',
+                       help='what attr export for example: remote')
+    options.add_option('-g', '--grep',
+                       dest='grep',
+                       help='grep something with filter to result')
+    options.add_option('-e', '--equal',
+                       dest='equal', action='store_true',
+                       help='equal <grep> with filter to result')
+    options.add_option('-s', '--opposite',
+                       dest='opposite', action='store_true',
+                       help='opposite result with filter to result')
+
+    options.add_option('-o', '--out',
+                       dest='out',
+                       help='out file')
+
+    option, _path = options.parse_args(argv)
+    if not option.attr:
+        options.print_help()
+        return
+    if not option.grep and not option.equal:
+        print("--grep not define, try all project!")
+
+    doc = xml.dom.minidom.Document()
+    root = doc.createElement('manifest')
+    doc.appendChild(root)
+
+    all_projects_list = manifest.projects
+    for project in all_projects_list:
+        if hasattr(project, option.attr):
+            result = getattr(project, option.attr)
+            if option.attr == 'remote':
+                result = result.name
+            if option.equal:
+                rm = result != option.grep
+            else:
+                rm = option.grep not in result
+            if option.opposite:
+                rm = not rm
+            if rm:
+                del manifest.paths[project.relpath]
+        else:
+            print("project:%s found attr:%s" % (project.relpath, option.attr))
+
+    if manifest.paths:
+        if option.out:
+            fd = open(option.out, 'w')
+        else:
+            fd = sys.stdout
+        manifest.Save(fd)
+
+
 def _main(argv):
-    command = {"remote", "revision", "rev"}
-    project_mode = 0
-    command_mode = "all"
-    if argv.__len__() > 0:
-        if not command.__contains__(argv[0]):
-            project_mode = 1
-        elif argv.__len__() == 1:
-            command_mode = argv[0]
+    command = {"remote", "revision", "rev", "gitlab", "export"}
 
     manifest = XmlManifest('.repo')
-    if project_mode:
-        _project_mode(argv, manifest)
-    else:
-        _project_all(command_mode, manifest)
-        print("###################################end")
-        for path in need_show:
-            print("\033[0;31;40m%s\033[0m" % str(path))
+    if argv.__len__() > 0:
+        if not command.__contains__(argv[0]):
+            _project_mode(argv, manifest)
+        elif argv[0] == "gitlab":
+            _gitlab(argv[1:], manifest)
+        elif argv[0] == "export":
+            _export(argv[1:], manifest)
+        else:
+            _project_all(argv, manifest)
+
+    if need_show.__len__() > 0:
+        print("###################run end###################")
+    for path in need_show:
+        _my_print(DEBUG.PATH, path)
 
 
+global_group_name = ''
+group_name_not_equal = 0
 need_show = list()
+DEBUG = None
 if __name__ == '__main__':
+    DEBUG = enum(NORMAL='39', PATH='39', WARR='32', ERROR='31', PROJECT='33', GROUP='34', SUBGROUP='35', REMOTE='36')
     _main(sys.argv[1:])
